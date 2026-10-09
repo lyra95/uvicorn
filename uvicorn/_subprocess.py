@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import signal
 import sys
 from collections.abc import Callable
 from multiprocessing.context import SpawnProcess
@@ -68,6 +69,15 @@ def subprocess_started(
     * stdin_fileno - The file number of sys.stdin, so that it can be reattached
                      to the child process.
     """
+    if os.name == "nt":  # pragma: py-not-win32
+        # Windows doesn't support SIGTERM, so we use SIGBREAK instead.
+        # And then we raise SIGTERM when SIGBREAK is received.
+        # https://learn.microsoft.com/zh-cn/cpp/c-runtime-library/reference/signal?view=msvc-170
+        signal.signal(
+            signal.SIGBREAK,
+            lambda sig, frame: signal.raise_signal(signal.SIGTERM),
+        )
+
     # Re-open stdin.
     if stdin_fileno is not None:
         sys.stdin = os.fdopen(stdin_fileno)  # pragma: full coverage

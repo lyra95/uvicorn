@@ -14,10 +14,14 @@ from uvicorn._ansi import style
 from uvicorn._subprocess import get_subprocess
 from uvicorn.config import Config
 
-HANDLED_SIGNALS = (
+HANDLED_SIGNALS: tuple[signal.Signals, ...] = (
     signal.SIGINT,  # Unix signal 2. Sent by Ctrl+C.
     signal.SIGTERM,  # Unix signal 15. Sent by `kill <pid>`.
 )
+if sys.platform == "win32":  # pragma: py-not-win32
+    # Windows delivers CTRL_BREAK_EVENT as SIGBREAK. The reloader shares its
+    # console with the child, so it has to handle the event it sends.
+    HANDLED_SIGNALS += (signal.SIGBREAK,)
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -34,17 +38,16 @@ class BaseReload:
         self.sockets = sockets
         self.should_exit = threading.Event()
         self.pid = os.getpid()
-        self.is_restarting = False
         self.reloader_name: str | None = None
 
     def signal_handler(self, sig: int, frame: FrameType | None) -> None:  # pragma: full coverage
         """
         A signal handler that is registered with the parent process.
         """
-        if sys.platform == "win32" and self.is_restarting:
-            self.is_restarting = False
-        else:
-            self.should_exit.set()
+        if sys.platform == "win32" and sig == signal.SIGBREAK:
+            # Sent by us to the child; the console delivers it here as well.
+            return
+        self.should_exit.set()
 
     def run(self) -> None:
         self.startup()
@@ -83,27 +86,28 @@ class BaseReload:
         self.process = get_subprocess(config=self.config, target=self.target, sockets=self.sockets)
         self.process.start()
 
-    def restart(self) -> None:
-        if sys.platform == "win32":  # pragma: py-not-win32
-            self.is_restarting = True
-            assert self.process.pid is not None
-            os.kill(self.process.pid, signal.CTRL_C_EVENT)
+    def _terminate_process(self) -> None:
+        """Ask the child process to shut down.
 
-            # This is a workaround to ensure the Ctrl+C event is processed
-            sys.stdout.write(" ")  # This has to be a non-empty string
-            sys.stdout.flush()
+        Windows has no SIGTERM, so send CTRL_BREAK_EVENT and let the child turn
+        it into SIGTERM, the same way `Multiprocess` stops its workers.
+        """
+        if sys.platform == "win32":  # pragma: py-not-win32
+            assert self.process.pid is not None
+            os.kill(self.process.pid, signal.CTRL_BREAK_EVENT)
         else:  # pragma: py-win32
             self.process.terminate()
+
+    def restart(self) -> None:
+        self._terminate_process()
         self.process.join()
 
         self.process = get_subprocess(config=self.config, target=self.target, sockets=self.sockets)
         self.process.start()
 
     def shutdown(self) -> None:
-        if sys.platform == "win32":
-            self.should_exit.set()  # pragma: py-not-win32
-        else:
-            self.process.terminate()  # pragma: py-win32
+        self.should_exit.set()
+        self._terminate_process()
         self.process.join()
 
         for sock in self.sockets:
