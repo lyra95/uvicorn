@@ -21,6 +21,9 @@ HANDLED_SIGNALS = (
 
 logger = logging.getLogger("uvicorn.error")
 
+# How long to wait for the child process to exit on its own before killing it.
+GRACEFUL_TIMEOUT = 5
+
 
 class BaseReload:
     def __init__(
@@ -94,17 +97,32 @@ class BaseReload:
             sys.stdout.flush()
         else:  # pragma: py-win32
             self.process.terminate()
-        self.process.join()
+        self._join_or_kill()
 
         self.process = get_subprocess(config=self.config, target=self.target, sockets=self.sockets)
         self.process.start()
+
+    def _join_or_kill(self) -> None:
+        """Wait for the child process to exit, killing it if it does not.
+
+        On Windows the child is stopped with a console control event, which is
+        delivered to a process group rather than to a single process. It does not
+        reach the child when there is no console attached -- running under a
+        debugger, or with the output redirected -- or when the child is not a
+        process group leader, and joining then blocks forever.
+        """
+        self.process.join(GRACEFUL_TIMEOUT)
+        if self.process.is_alive():
+            logger.warning("Child process [%s] did not exit, killing it.", self.process.pid)
+            self.process.kill()
+            self.process.join()
 
     def shutdown(self) -> None:
         if sys.platform == "win32":
             self.should_exit.set()  # pragma: py-not-win32
         else:
             self.process.terminate()  # pragma: py-win32
-        self.process.join()
+        self._join_or_kill()
 
         for sock in self.sockets:
             sock.close()

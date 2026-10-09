@@ -13,6 +13,7 @@ from pytest_mock import MockerFixture
 
 from tests.utils import as_cwd
 from uvicorn.config import Config
+from uvicorn.supervisors import basereload
 from uvicorn.supervisors.basereload import BaseReload, _display_path
 from uvicorn.supervisors.statreload import StatReload
 
@@ -436,3 +437,98 @@ def test_file_filter_excluded_directory(tmp_path: Path) -> None:
 
     assert file_filter(tmp_path / "app.py")
     assert not file_filter(excluded_dir / "app.py")
+
+
+class UnresponsiveProcess:
+    """A child process that ignores the shutdown signal, like a Windows child
+    that never receives the console control event sent by `restart()`."""
+
+    pid = 12345
+
+    def __init__(self, exits_on_join: bool = False) -> None:
+        self._alive = True
+        self._exits_on_join = exits_on_join
+        self.killed = False
+        self.join_timeouts: list[float | None] = []
+
+    def start(self) -> None:
+        self._alive = True
+
+    def terminate(self) -> None:
+        pass
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def join(self, timeout: float | None = None) -> None:
+        self.join_timeouts.append(timeout)
+        if self._exits_on_join:
+            self._alive = False
+
+    def kill(self) -> None:
+        self.killed = True
+        self._alive = False
+
+
+def test_join_or_kill_kills_unresponsive_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A child that ignores the shutdown signal must not block the reloader."""
+    monkeypatch.setattr(basereload, "GRACEFUL_TIMEOUT", 0.0)
+    config = Config(app="tests.test_config:asgi_app", reload=True)
+    reloader = BaseReload(config, target=run, sockets=[])
+    process = UnresponsiveProcess()
+    reloader.process = process  # type: ignore[assignment]
+
+    reloader._join_or_kill()
+
+    assert process.join_timeouts == [0.0, None]
+    assert process.killed
+    assert not process.is_alive()
+
+
+def test_join_or_kill_waits_for_responsive_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A child that exits on its own is never killed."""
+    monkeypatch.setattr(basereload, "GRACEFUL_TIMEOUT", 0.0)
+    config = Config(app="tests.test_config:asgi_app", reload=True)
+    reloader = BaseReload(config, target=run, sockets=[])
+    process = UnresponsiveProcess(exits_on_join=True)
+    reloader.process = process  # type: ignore[assignment]
+
+    reloader._join_or_kill()
+
+    assert process.join_timeouts == [0.0]
+    assert not process.killed
+
+
+def test_shutdown_closes_sockets_with_unresponsive_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shutdown must complete even when the child ignores the shutdown signal."""
+    monkeypatch.setattr(basereload, "GRACEFUL_TIMEOUT", 0.0)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    config = Config(app="tests.test_config:asgi_app", reload=True)
+    reloader = BaseReload(config, target=run, sockets=[sock])
+    process = UnresponsiveProcess()
+    reloader.process = process  # type: ignore[assignment]
+
+    reloader.shutdown()
+
+    assert process.killed
+    assert sock.fileno() == -1
+
+
+def test_restart_replaces_unresponsive_child(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture) -> None:
+    """A new child is started even when the previous one had to be killed."""
+    monkeypatch.setattr(basereload, "GRACEFUL_TIMEOUT", 0.0)
+    # The child is a stub, so do not actually signal it.
+    mocker.patch.object(basereload.os, "kill")
+    new_process = UnresponsiveProcess()
+    get_subprocess = mocker.patch.object(basereload, "get_subprocess", return_value=new_process)
+
+    config = Config(app="tests.test_config:asgi_app", reload=True)
+    reloader = BaseReload(config, target=run, sockets=[])
+    old_process = UnresponsiveProcess()
+    reloader.process = old_process  # type: ignore[assignment]
+
+    reloader.restart()
+
+    assert old_process.killed
+    assert get_subprocess.call_count == 1
+    assert reloader.process is new_process
